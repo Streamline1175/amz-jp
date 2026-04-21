@@ -84,7 +84,7 @@ def _process_offers(
                 "RESTOCK  asin=%-14s  seller=%-20s  name=%s  price=%s",
                 asin, seller_id, seller_name, f"¥{price_jpy:,}" if price_jpy else "N/A",
             )
-            restock_id = db.record_restock(asin, seller_id, price_jpy, condition, fulfillment)
+            restock_id = db.record_restock(asin, seller_id, price_jpy, condition, fulfillment, is_new_seller)
             restocks.append({
                 "id":           restock_id,
                 "asin":         asin,

@@ -152,14 +152,19 @@ def _truncate(text: str, max_len: int) -> str:
 
 def _to_iso_utc(ts: str) -> str:
     """
-    Normalise a local datetime string (from SQLite) to a UTC ISO-8601 string
-    that Discord's embed timestamp field accepts.
+    Normalise a datetime string from SQLite to a UTC ISO-8601 string for
+    Discord's embed timestamp field.
+
+    SQLite stores all timestamps as UTC via datetime('now'), so naive strings
+    are correctly interpreted as UTC — we attach tzinfo without conversion.
+    Timezone-aware strings (e.g. from Python code) are converted to UTC.
     """
     try:
         dt = datetime.fromisoformat(ts)
         if dt.tzinfo is None:
-            # Assume local time (JST = UTC+9); just mark as UTC for embed display
             dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
         return dt.isoformat()
     except ValueError:
         return datetime.now(timezone.utc).isoformat()

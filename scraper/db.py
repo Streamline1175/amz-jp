@@ -19,13 +19,13 @@ CREATE TABLE IF NOT EXISTS products (
     asin        TEXT PRIMARY KEY,
     name        TEXT,
     url         TEXT,
-    created_at  TEXT DEFAULT (datetime('now', 'localtime'))
+    created_at  TEXT DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS sellers (
     seller_id   TEXT PRIMARY KEY,
     seller_name TEXT,
-    first_seen  TEXT DEFAULT (datetime('now', 'localtime'))
+    first_seen  TEXT DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS offers (
@@ -36,20 +36,21 @@ CREATE TABLE IF NOT EXISTS offers (
     condition   TEXT,
     fulfillment TEXT,
     in_stock    INTEGER NOT NULL DEFAULT 1,
-    scraped_at  TEXT    DEFAULT (datetime('now', 'localtime')),
+    scraped_at  TEXT    DEFAULT (datetime('now')),
     FOREIGN KEY (asin)      REFERENCES products(asin),
     FOREIGN KEY (seller_id) REFERENCES sellers(seller_id)
 );
 
 CREATE TABLE IF NOT EXISTS restock_events (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    asin        TEXT    NOT NULL,
-    seller_id   TEXT    NOT NULL,
-    price_jpy   INTEGER,
-    condition   TEXT,
-    fulfillment TEXT,
-    detected_at TEXT    DEFAULT (datetime('now', 'localtime')),
-    notified    INTEGER NOT NULL DEFAULT 0
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    asin          TEXT    NOT NULL,
+    seller_id     TEXT    NOT NULL,
+    price_jpy     INTEGER,
+    condition     TEXT,
+    fulfillment   TEXT,
+    is_new_seller INTEGER NOT NULL DEFAULT 0,
+    detected_at   TEXT    DEFAULT (datetime('now')),
+    notified      INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_offers_asin_seller  ON offers(asin, seller_id);
@@ -70,6 +71,10 @@ class Database:
     def _init(self) -> None:
         with self._conn() as conn:
             conn.executescript(_SCHEMA)
+            # Safe migration: add is_new_seller to pre-existing databases
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(restock_events)")}
+            if "is_new_seller" not in cols:
+                conn.execute("ALTER TABLE restock_events ADD COLUMN is_new_seller INTEGER NOT NULL DEFAULT 0")
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
@@ -156,12 +161,12 @@ class Database:
     # ------------------------------------------------------------------
 
     def record_restock(self, asin: str, seller_id: str, price_jpy: Optional[int],
-                       condition: str, fulfillment: str) -> int:
+                       condition: str, fulfillment: str, is_new_seller: bool = False) -> int:
         with self._conn() as conn:
             cur = conn.execute(
-                """INSERT INTO restock_events (asin, seller_id, price_jpy, condition, fulfillment)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (asin, seller_id, price_jpy, condition, fulfillment),
+                """INSERT INTO restock_events (asin, seller_id, price_jpy, condition, fulfillment, is_new_seller)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (asin, seller_id, price_jpy, condition, fulfillment, 1 if is_new_seller else 0),
             )
             return cur.lastrowid
 

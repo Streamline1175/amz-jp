@@ -36,29 +36,35 @@ PRODUCT_URL  = "https://www.amazon.co.jp/dp/{asin}/"
 # curl_cffi impersonation profile — must match the UA we advertise
 _IMPERSONATE = "chrome124"
 
-_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+# Each profile keeps the UA and its matching Sec-CH-UA-Platform together so
+# they never produce an inconsistent (e.g. Linux UA + Windows hint) pair.
+_UA_PROFILES = [
+    {
+        "ua":       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "platform": '"Windows"',
+    },
+    {
+        "ua":       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "platform": '"macOS"',
+    },
+    {
+        "ua":       "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "platform": '"Linux"',
+    },
 ]
 
-# Chrome client-hint headers that must accompany Chrome UA strings
-_CHROME_HINTS = {
-    "Sec-CH-UA": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "Sec-CH-UA-Mobile": "?0",
-    "Sec-CH-UA-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
-}
-
+# Static Chrome client-hint headers (platform is injected per-request from the profile)
 _BASE_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
     "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
-    **_CHROME_HINTS,
+    "Sec-CH-UA": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-CH-UA-Mobile": "?0",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
 }
 
 # Cookie that ensures prices come back in yen, not USD
@@ -250,20 +256,23 @@ class AmazonJPScraper:
         referer: Optional[str]  = None,
         is_ajax: bool           = False,
     ):
-        ua = random.choice(_USER_AGENTS)
-        headers: dict[str, str] = {"User-Agent": ua}
+        profile = random.choice(_UA_PROFILES)
+        headers: dict[str, str] = {
+            "User-Agent":        profile["ua"],
+            "Sec-CH-UA-Platform": profile["platform"],
+        }
         if referer:
             headers["Referer"] = referer
         if is_ajax:
             # Required by Amazon's AOD endpoint to return the HTML fragment
             headers["X-Requested-With"] = "XMLHttpRequest"
 
-        proxy_url: Optional[str] = None
-        if self.proxy_manager:
-            proxy_url = self.proxy_manager.get_proxy()
-        proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-
         for attempt in range(1, self.max_retries + 1):
+            # Select (and potentially rotate) proxy on every attempt so that
+            # marking a proxy bad on a 503 actually takes effect next retry.
+            proxy_url: Optional[str] = self.proxy_manager.get_proxy() if self.proxy_manager else None
+            proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+
             try:
                 resp = self.session.get(
                     url,
@@ -284,6 +293,8 @@ class AmazonJPScraper:
                     return None
             except Exception as exc:
                 logger.warning("Request error (attempt %d/%d): %s", attempt, self.max_retries, exc)
+                if self.proxy_manager and proxy_url:
+                    self.proxy_manager.mark_bad(proxy_url)
                 time.sleep(2 ** attempt)
 
         logger.error("All retries exhausted for %s", url)
