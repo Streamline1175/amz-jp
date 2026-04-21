@@ -1,0 +1,35 @@
+# systemd service unit for the Amazon JP stock monitor.
+#
+# Install on your Raspberry Pi:
+#   sudo cp amz-monitor.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now amz-monitor
+#   sudo journalctl -u amz-monitor -f       # tail logs
+
+[Unit]
+Description=Amazon JP Stock Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# ── Change these two lines to match your setup ────────────────────────
+User=pi
+WorkingDirectory=/home/pi/amz-jp
+# ─────────────────────────────────────────────────────────────────────
+
+EnvironmentFile=%h/amz-jp/.env
+ExecStart=/home/pi/amz-jp/.venv/bin/python main.py
+
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+# Resource caps (friendly to RPI)
+MemoryMax=256M
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target
