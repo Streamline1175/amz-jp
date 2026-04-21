@@ -3,12 +3,18 @@ Amazon JP All-Offers Display (AOD) scraper.
 
 Hits the undocumented AOD AJAX endpoint that powers the "See all buying options"
 panel on product pages:
-  GET https://www.amazon.co.jp/gp/aod/ajax?asin=<ASIN>&pc=dp&isonlyrenderofferlistingpage=1&pageno=<N>
 
-Returns an HTML fragment containing offer cards. Each card carries:
-  - data-csa-c-seller-id  →  seller OID
-  - Seller name in a link with href containing ?seller=<OID>
-  - Price, condition, fulfillment type
+  GET https://www.amazon.co.jp/gp/aod/ajax/ref=auto_load_aod
+      ?asin=<ASIN>&pc=dp&qty=1&pageno=<N>
+
+Returns an HTML fragment containing one `div#aod-offer` block per seller.
+
+TLS fingerprinting note
+-----------------------
+Amazon fingerprints the TLS handshake (JA3/JA4). Plain `requests` or
+`httpx` expose a Python TLS signature that gets flagged regardless of
+User-Agent. We use `curl_cffi` with impersonate="chrome124" to emit
+a real Chrome TLS hello, bypassing that check.
 """
 
 import logging
@@ -16,23 +22,35 @@ import random
 import re
 import time
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
-import requests
+from curl_cffi import requests as curl_requests
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-AOD_AJAX_URL = "https://www.amazon.co.jp/gp/aod/ajax"
-PRODUCT_URL = "https://www.amazon.co.jp/dp/{asin}/"
+# Correct AOD endpoint — ref= is part of the path, not a query param
+AOD_AJAX_URL = "https://www.amazon.co.jp/gp/aod/ajax/ref=auto_load_aod"
+PRODUCT_URL  = "https://www.amazon.co.jp/dp/{asin}/"
 
-# Rotate UAs to avoid trivial bot detection
+# curl_cffi impersonation profile — must match the UA we advertise
+_IMPERSONATE = "chrome124"
+
 _USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
 ]
+
+# Chrome client-hint headers that must accompany Chrome UA strings
+_CHROME_HINTS = {
+    "Sec-CH-UA": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-CH-UA-Mobile": "?0",
+    "Sec-CH-UA-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+}
 
 _BASE_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -40,10 +58,11 @@ _BASE_HEADERS = {
     "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
+    **_CHROME_HINTS,
 }
 
-# Seller OID regex: Amazon seller IDs are uppercase alphanumeric, ~14 chars
-_SELLER_ID_RE = re.compile(r"[?&]seller=([A-Z0-9]{10,20})")
+# Cookie that ensures prices come back in yen, not USD
+_JP_COOKIES = {"i18n-prefs": "JPY"}
 
 
 class AmazonJPScraper:
@@ -53,11 +72,13 @@ class AmazonJPScraper:
         request_delay: tuple[float, float] = (3.0, 7.0),
         max_retries: int = 3,
     ):
-        self.proxy_manager = proxy_manager
-        self.request_delay = request_delay
-        self.max_retries = max_retries
-        self.session = requests.Session()
+        self.proxy_manager   = proxy_manager
+        self.request_delay   = request_delay
+        self.max_retries     = max_retries
+        # curl_cffi session — impersonate spoofs TLS cipher suite + extensions
+        self.session = curl_requests.Session(impersonate=_IMPERSONATE)
         self.session.headers.update(_BASE_HEADERS)
+        self.session.cookies.update(_JP_COOKIES)
 
     # ------------------------------------------------------------------
     # Public API
@@ -65,7 +86,7 @@ class AmazonJPScraper:
 
     def fetch_offers(self, asin: str) -> list[dict]:
         """Return all active offers for *asin* as a list of dicts."""
-        # Seed the session with real cookies by visiting the product page first
+        # Seed session cookies by visiting the product page first
         self._get(PRODUCT_URL.format(asin=asin))
         time.sleep(random.uniform(*self.request_delay))
 
@@ -74,15 +95,16 @@ class AmazonJPScraper:
 
         while True:
             params = {
-                "asin": asin,
-                "pc": "dp",
-                "isonlyrenderofferlistingpage": "1",
-                "pageno": page,
+                "asin":    asin,
+                "pc":      "dp",
+                "qty":     "1",
+                "pageno":  page,
             }
             resp = self._get(
                 AOD_AJAX_URL,
                 params=params,
                 referer=PRODUCT_URL.format(asin=asin),
+                is_ajax=True,
             )
             if resp is None:
                 break
@@ -120,21 +142,18 @@ class AmazonJPScraper:
     # ------------------------------------------------------------------
 
     def _parse_aod_html(self, html: str, asin: str) -> list[dict]:
-        soup = BeautifulSoup(html, "html.parser")
+        soup  = BeautifulSoup(html, "html.parser")
         offers: list[dict] = []
 
-        # The pinned / featured offer sits in a dedicated container
+        # The pinned / featured (Buy Box) offer sits in its own container
         pinned = soup.select_one("#aod-pinned-offer")
         if pinned:
             offer = self._extract_offer(pinned, asin)
             if offer:
                 offers.append(offer)
 
-        # Remaining non-pinned offers
-        for div in soup.select("div#aod-offer, div[id^='aod-offer-']:not(#aod-offer-heading)"):
-            # Skip child divs that are not top-level offer cards
-            if div.parent and div.parent.get("id", "").startswith("aod-offer"):
-                continue
+        # Non-pinned offers — each is a direct child div with id="aod-offer"
+        for div in soup.select("div#aod-offer"):
             offer = self._extract_offer(div, asin)
             if offer:
                 offers.append(offer)
@@ -143,59 +162,52 @@ class AmazonJPScraper:
 
     def _extract_offer(self, div, asin: str) -> Optional[dict]:
         # ── Seller OID ──────────────────────────────────────────────────
+        # Priority: data attribute > soldBy link href > hidden input > Amazon fallback
         seller_id: Optional[str] = (
             div.get("data-csa-c-seller-id")
             or div.get("data-seller-id")
         )
-
         seller_name: Optional[str] = None
 
-        # Seller link carries the OID in the URL and the name as text
-        for sel in (
-            "#aod-offer-soldBy a",
-            "a[href*='seller=']",
-            "a[href*='gp/aawrs']",
-            ".mbcMerchantName a",
-            "span.a-size-small a",
-        ):
-            link = div.select_one(sel)
+        # The confirmed structure from the AOD response:
+        #   <div id="aod-offer-soldBy">
+        #     <a href="/gp/aag/main?seller=AXXXXXXXX">Seller Name</a>
+        #   </div>
+        sold_by_div = div.select_one("#aod-offer-soldBy")
+        if sold_by_div:
+            link = sold_by_div.select_one("a[href]")
             if link:
-                href = link.get("href", "")
-                m = _SELLER_ID_RE.search(href)
-                if m:
-                    seller_id = seller_id or m.group(1)
-                text = link.get_text(strip=True)
-                if text:
-                    seller_name = text
-                break
+                seller_id   = seller_id or _extract_seller_param(link["href"])
+                seller_name = link.get_text(strip=True) or None
 
-        # Hidden input fallback (add-to-cart forms)
+        # Broader fallback selectors
+        if not seller_id:
+            for sel in ("a[href*='seller=']", "a[href*='gp/aag/main']", "a[href*='/sp?']"):
+                link = div.select_one(sel)
+                if link:
+                    seller_id   = _extract_seller_param(link.get("href", ""))
+                    seller_name = seller_name or link.get_text(strip=True) or None
+                    break
+
+        # Hidden input inside add-to-cart form
         if not seller_id:
             inp = div.select_one("input[name='seller']")
             if inp:
                 seller_id = inp.get("value")
 
-        # Amazon itself as seller (no seller link present)
-        sold_by_text = ""
-        sold_by_div = div.select_one("#aod-offer-soldBy, .a-size-small")
-        if sold_by_div:
-            sold_by_text = sold_by_div.get_text(strip=True)
-
-        if not seller_id and ("Amazon" in sold_by_text or "アマゾン" in sold_by_text):
-            seller_id = "ATVPDKIKX0DER"  # Amazon JP's own seller ID
-            seller_name = "Amazon.co.jp"
+        # Amazon itself as seller — no anchor link, just text
+        if not seller_id:
+            text = (sold_by_div or div).get_text()
+            if "Amazon" in text or "アマゾン" in text:
+                seller_id   = "ATVPDKIKX0DER"  # Amazon JP's own OID
+                seller_name = "Amazon.co.jp"
 
         if not seller_id:
             return None
 
         # ── Price ────────────────────────────────────────────────────────
         price_jpy: Optional[int] = None
-        for sel in (
-            ".a-price .a-offscreen",
-            "span.a-price-whole",
-            ".a-color-price",
-            "#aod-price-1",
-        ):
+        for sel in (".a-price .a-offscreen", "span.a-price-whole", ".a-color-price"):
             el = div.select_one(sel)
             if el:
                 price_jpy = _parse_jpy(el.get_text(strip=True))
@@ -212,19 +224,19 @@ class AmazonJPScraper:
         full_text = div.get_text()
         if seller_id == "ATVPDKIKX0DER":
             fulfillment = "AMAZON"
-        elif "Amazon" in full_text and ("発送" in full_text or "出荷" in full_text or "配送" in full_text):
+        elif "Amazon" in full_text and any(w in full_text for w in ("発送", "出荷", "配送")):
             fulfillment = "FBA"
         else:
             fulfillment = "FBM"
 
         return {
-            "asin": asin,
-            "seller_id": seller_id,
+            "asin":        asin,
+            "seller_id":   seller_id,
             "seller_name": seller_name or "Unknown",
-            "price_jpy": price_jpy,
-            "condition": condition,
+            "price_jpy":   price_jpy,
+            "condition":   condition,
             "fulfillment": fulfillment,
-            "in_stock": True,
+            "in_stock":    True,
         }
 
     # ------------------------------------------------------------------
@@ -234,12 +246,17 @@ class AmazonJPScraper:
     def _get(
         self,
         url: str,
-        params: Optional[dict] = None,
-        referer: Optional[str] = None,
-    ) -> Optional[requests.Response]:
-        headers = {"User-Agent": random.choice(_USER_AGENTS)}
+        params: Optional[dict]  = None,
+        referer: Optional[str]  = None,
+        is_ajax: bool           = False,
+    ):
+        ua = random.choice(_USER_AGENTS)
+        headers: dict[str, str] = {"User-Agent": ua}
         if referer:
             headers["Referer"] = referer
+        if is_ajax:
+            # Required by Amazon's AOD endpoint to return the HTML fragment
+            headers["X-Requested-With"] = "XMLHttpRequest"
 
         proxy_url: Optional[str] = None
         if self.proxy_manager:
@@ -258,14 +275,14 @@ class AmazonJPScraper:
                 if resp.status_code == 200:
                     return resp
                 if resp.status_code == 503:
-                    logger.warning("503 from Amazon (attempt %d/%d) — backing off", attempt, self.max_retries)
+                    logger.warning("503 (attempt %d/%d) — backing off", attempt, self.max_retries)
                     if self.proxy_manager and proxy_url:
                         self.proxy_manager.mark_bad(proxy_url)
                     time.sleep(2 ** attempt)
                 else:
                     logger.error("HTTP %s for %s", resp.status_code, url)
                     return None
-            except requests.RequestException as exc:
+            except Exception as exc:
                 logger.warning("Request error (attempt %d/%d): %s", attempt, self.max_retries, exc)
                 time.sleep(2 ** attempt)
 
@@ -276,6 +293,16 @@ class AmazonJPScraper:
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+
+def _extract_seller_param(href: str) -> Optional[str]:
+    """Pull the seller= query parameter out of an Amazon URL."""
+    try:
+        qs = parse_qs(urlparse(href).query)
+        values = qs.get("seller") or qs.get("smid") or qs.get("me")
+        return values[0] if values else None
+    except Exception:
+        return None
+
 
 def _parse_jpy(text: str) -> Optional[int]:
     digits = re.sub(r"[^\d]", "", text)
